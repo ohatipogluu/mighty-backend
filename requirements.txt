@@ -8,3 +8,4 @@ httpx
 google-generativeai
 motor
 dnspython
+geopy
