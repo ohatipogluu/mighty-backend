@@ -19,6 +19,21 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 # ============================================================
+# LOGGING SETUP (Early initialization)
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# PORT CONFIGURATION (Render.com compatibility)
+# ============================================================
+PORT = int(os.environ.get("PORT", 8000))
+logger.info(f"Server will start on port: {PORT}")
+
+# ============================================================
 # LLM CONFIGURATION - EASY SWAP
 # ============================================================
 LLM_PROVIDER = os.environ.get('LLM_PROVIDER', 'emergent')
@@ -39,10 +54,45 @@ def get_llm_config():
 if LLM_PROVIDER == 'emergent':
     from emergentintegrations.llm.chat import LlmChat, UserMessage
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# ============================================================
+# MONGODB CONNECTION (Non-blocking with fallback)
+# ============================================================
+client = None
+db = None
+DB_CONNECTED = False
+
+def init_database():
+    """Initialize MongoDB connection with error handling"""
+    global client, db, DB_CONNECTED
+    
+    try:
+        mongo_url = os.environ.get('MONGO_URL')
+        db_name = os.environ.get('DB_NAME', 'islamic_portal')
+        
+        if not mongo_url:
+            logger.warning("MONGO_URL not set - database features disabled")
+            return False
+        
+        # Create client with timeout settings
+        client = AsyncIOMotorClient(
+            mongo_url,
+            serverSelectionTimeoutMS=5000,  # 5 second timeout
+            connectTimeoutMS=5000,
+            socketTimeoutMS=5000
+        )
+        db = client[db_name]
+        DB_CONNECTED = True
+        logger.info(f"MongoDB connection initialized: {db_name}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"MongoDB connection failed: {e}")
+        logger.warning("Server will continue without database - some features may be limited")
+        DB_CONNECTED = False
+        return False
+
+# Initialize database (non-blocking)
+init_database()
 
 # Create the main app
 app = FastAPI()
@@ -543,12 +593,16 @@ Format your response as:
         else:
             raise HTTPException(status_code=501, detail="Native Google Gemini not implemented")
         
-        # Store messages
-        user_msg = ChatMessage(session_id=request.session_id, role="user", content=request.message)
-        await db.chat_messages.insert_one(user_msg.dict())
-        
-        assistant_msg = ChatMessage(session_id=request.session_id, role="assistant", content=response)
-        await db.chat_messages.insert_one(assistant_msg.dict())
+        # Store messages (only if DB is connected)
+        if DB_CONNECTED and db is not None:
+            try:
+                user_msg = ChatMessage(session_id=request.session_id, role="user", content=request.message)
+                await db.chat_messages.insert_one(user_msg.dict())
+                
+                assistant_msg = ChatMessage(session_id=request.session_id, role="assistant", content=response)
+                await db.chat_messages.insert_one(assistant_msg.dict())
+            except Exception as db_err:
+                logger.warning(f"Failed to save chat to DB: {db_err}")
         
         return ChatResponse(response=response, session_id=request.session_id)
     except Exception as e:
@@ -558,17 +612,31 @@ Format your response as:
 @api_router.get("/chat/history/{session_id}")
 async def get_chat_history(session_id: str):
     """Get chat history for a session"""
-    history = await db.chat_messages.find(
-        {"session_id": session_id}
-    ).sort("timestamp", 1).to_list(100)
+    if not DB_CONNECTED or db is None:
+        return []  # Return empty if no DB connection
     
-    return [{"role": msg["role"], "content": msg["content"]} for msg in history]
+    try:
+        history = await db.chat_messages.find(
+            {"session_id": session_id}
+        ).sort("timestamp", 1).to_list(100)
+        
+        return [{"role": msg["role"], "content": msg["content"]} for msg in history]
+    except Exception as e:
+        logger.warning(f"Failed to get chat history: {e}")
+        return []
 
 @api_router.delete("/chat/history/{session_id}")
 async def clear_chat_history(session_id: str):
     """Clear chat history for a session"""
-    await db.chat_messages.delete_many({"session_id": session_id})
-    return {"message": "Chat history cleared"}
+    if not DB_CONNECTED or db is None:
+        return {"message": "Chat history cleared (no DB connection)"}
+    
+    try:
+        await db.chat_messages.delete_many({"session_id": session_id})
+        return {"message": "Chat history cleared"}
+    except Exception as e:
+        logger.warning(f"Failed to clear chat history: {e}")
+        return {"message": "Chat history cleared (with errors)"}
 
 # ================== QURAN TRANSLATION API (DYNAMIC LANGUAGE) ==================
 
@@ -738,12 +806,43 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# ============================================================
+# HEALTH CHECK ENDPOINT
+# ============================================================
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Render.com and other platforms"""
+    return {
+        "status": "healthy",
+        "database": "connected" if DB_CONNECTED else "disconnected",
+        "port": PORT
+    }
+
+# ============================================================
+# STARTUP & SHUTDOWN EVENTS
+# ============================================================
+@app.on_event("startup")
+async def startup_event():
+    """Application startup"""
+    logger.info(f"🕌 Islamic Portal API started on port {PORT}")
+    logger.info(f"📊 Database status: {'connected' if DB_CONNECTED else 'disconnected'}")
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    """Clean shutdown"""
+    if client:
+        client.close()
+        logger.info("MongoDB connection closed")
+
+# ============================================================
+# MAIN ENTRY POINT (for Render.com and direct execution)
+# ============================================================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=PORT,
+        reload=False,  # Disable reload in production
+        log_level="info"
+    )
